@@ -175,7 +175,7 @@ async def test_shipment_agent_late_delivery_logistics(
     assert rca["ranked_causes"][0]["cause_code"] == "LOGISTICS_DELAY"
     assert rca["ranked_causes"][0]["rank"] == 1
     assert rca["responsible_parties"][0]["party_type"] == "logistics_provider"
-    assert rca["responsible_parties"][0]["party_id"] == "logistics_partner_1"
+    assert rca["responsible_parties"][0]["party_id"] is None
 
 
 @pytest.mark.anyio
@@ -210,3 +210,255 @@ async def test_shipment_agent_on_time(trace_writer: TraceWriter) -> None:
     assert result.sla_breached_by is None
     assert result.root_cause_analysis["ranked_causes"] == []
     assert result.root_cause_analysis["responsible_parties"] == []
+
+
+@pytest.mark.anyio
+async def test_shipment_agent_real_data_format_seller_late(
+    trace_writer: TraceWriter,
+) -> None:
+    """Test using realistic MCP structure: shipping_limits list, delivered_carrier_at,
+
+    estimated_delivery_at, delivered_customer_at, and get_sellers taking order_id.
+    """
+    gateway = AsyncMock()
+
+    async def mock_call(tool_name: str, *, case_id: str, **kwargs: Any) -> dict[str, Any]:
+        if tool_name == "get_shipment_summary":
+            assert kwargs.get("order_id") == "ord_real_001"
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": "ev_shipment_summary_real_001_123456789012",
+                "result_hash": "sha256:" + "0" * 64,
+                "domain": "shipment",
+                "data": {
+                    "order_id": "ord_real_001",
+                    "order_status": "delivered",
+                    "delivered_carrier_at": "2018-03-05T09:00:00-03:00",  # late handover
+                    "delivered_customer_at": "2018-03-12T09:00:00-03:00",  # late delivery
+                    "estimated_delivery_at": "2018-03-10T09:00:00-03:00",
+                    "shipping_limits": [
+                        {
+                            "order_item_id": "item_001",
+                            "seller_id": "seller_real_1",
+                            "shipping_limit_at": "2018-03-04T09:00:00-03:00",
+                        },
+                        # Noise row after case opened_at
+                        {
+                            "order_item_id": "item_001",
+                            "seller_id": "seller_noise",
+                            "shipping_limit_at": "2018-08-01T09:00:00-03:00",
+                        },
+                    ],
+                    "events": [
+                        {
+                            "event_at": "2018-03-12T09:00:00-03:00",
+                            "event_type": "delivered_late",
+                            "actor": "seller",
+                            "status": "confirmed",
+                        }
+                    ],
+                },
+            }
+        elif tool_name == "get_sellers":
+            assert kwargs.get("order_id") == "ord_real_001"
+            assert "seller_id" not in kwargs  # Tool expects order_id only
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": "ev_sellers_info_real_001_12345678901234",
+                "result_hash": "sha256:" + "1" * 64,
+                "domain": "seller",
+                "data": [
+                    {
+                        "seller_id": "seller_real_1",
+                        "seller_zip_code_prefix": "01001",
+                        "seller_city": "Sao Paulo",
+                        "seller_state": "SP",
+                    }
+                ],
+            }
+        raise ValueError(f"Unexpected tool: {tool_name}")
+
+    gateway.call = AsyncMock(side_effect=mock_call)
+    agent = ShipmentAgent(gateway, trace_writer)
+    result = await agent.investigate(
+        case_id="L3A_CASE_REAL_001",
+        claimed_order_id="ord_real_001",
+        case_opened_at="2018-03-15T09:00:00-03:00",
+        order_purchase_at="2018-03-01T09:00:00-03:00",
+    )
+
+    assert result.primary_issue_candidate == "late_delivery_seller"
+    assert result.sla_breached_by == "seller"
+    assert "seller_real_1" in result.seller_ids
+    assert "seller_noise" not in result.seller_ids  # Filtered out by window
+    assert len(result.evidence_refs) == 2
+
+
+@pytest.mark.anyio
+async def test_shipment_agent_real_data_format_logistics_late(
+    trace_writer: TraceWriter,
+) -> None:
+    """Test logistics late with real structure: carrier handed over on time, delivered late."""
+    gateway = AsyncMock()
+
+    async def mock_call(tool_name: str, *, case_id: str, **kwargs: Any) -> dict[str, Any]:
+        if tool_name == "get_shipment_summary":
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": "ev_shipment_summary_real_002_123456789012",
+                "result_hash": "sha256:" + "0" * 64,
+                "domain": "shipment",
+                "data": {
+                    "order_id": "ord_real_002",
+                    "order_status": "delivered",
+                    "delivered_carrier_at": "2018-03-03T09:00:00-03:00",  # On time (<= 03-04)
+                    "delivered_customer_at": "2018-03-12T09:00:00-03:00",  # Late (> 03-10)
+                    "estimated_delivery_at": "2018-03-10T09:00:00-03:00",
+                    "shipping_limits": [
+                        {
+                            "order_item_id": "item_002",
+                            "seller_id": "seller_real_2",
+                            "shipping_limit_at": "2018-03-04T09:00:00-03:00",
+                        }
+                    ],
+                },
+            }
+        elif tool_name == "get_sellers":
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": "ev_sellers_info_real_002_12345678901234",
+                "result_hash": "sha256:" + "1" * 64,
+                "domain": "seller",
+                "data": [{"seller_id": "seller_real_2"}],
+            }
+        raise ValueError(f"Unexpected tool: {tool_name}")
+
+    gateway.call = AsyncMock(side_effect=mock_call)
+    agent = ShipmentAgent(gateway, trace_writer)
+    result = await agent.investigate(
+        case_id="L3A_CASE_REAL_002",
+        claimed_order_id="ord_real_002",
+        case_opened_at="2018-03-15T09:00:00-03:00",
+    )
+
+    assert result.primary_issue_candidate == "late_delivery_logistics"
+    assert result.sla_breached_by == "logistics"
+    rca = result.root_cause_analysis
+    assert rca["responsible_parties"][0]["party_type"] == "logistics_provider"
+    assert rca["responsible_parties"][0]["party_id"] is None
+
+
+@pytest.mark.anyio
+async def test_shipment_agent_unsupported_claim_noise_delivered_late(
+    trace_writer: TraceWriter,
+) -> None:
+    """Test DoD: Case unsupported_claim (có delivered_late nhiễu sau opened_at) -> None."""
+    gateway = AsyncMock()
+
+    async def mock_call(tool_name: str, *, case_id: str, **kwargs: Any) -> dict[str, Any]:
+        if tool_name == "get_shipment_summary":
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": "ev_shipment_summary_noise_12345678901234",
+                "result_hash": "sha256:" + "0" * 64,
+                "domain": "shipment",
+                "data": {
+                    "order_id": "ord_noise",
+                    "order_status": "delivered",
+                    "delivered_carrier_at": "2017-12-22T09:00:00-03:00",
+                    # Delivered on time (12-28 <= estimated 12-30)
+                    "delivered_customer_at": "2017-12-28T09:00:00-03:00",
+                    "estimated_delivery_at": "2017-12-30T09:00:00-03:00",
+                    "shipping_limits": [
+                        {
+                            "order_item_id": "item_001",
+                            "seller_id": "seller_1",
+                            "shipping_limit_at": "2017-12-23T09:00:00-03:00",
+                        }
+                    ],
+                    # Noisy event months after opened_at
+                    "events": [
+                        {
+                            "event_at": "2018-05-25T09:00:00-03:00",
+                            "event_type": "delivered_late",
+                            "actor": "seller",
+                            "status": "confirmed",
+                        }
+                    ],
+                },
+            }
+        elif tool_name == "get_sellers":
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": "ev_sellers_info_noise_1234567890123456",
+                "result_hash": "sha256:" + "1" * 64,
+                "domain": "seller",
+                "data": [{"seller_id": "seller_1"}],
+            }
+        raise ValueError(f"Unexpected tool: {tool_name}")
+
+    gateway.call = AsyncMock(side_effect=mock_call)
+    agent = ShipmentAgent(gateway, trace_writer)
+    result = await agent.investigate(
+        case_id="L3A_CASE_NOISE",
+        claimed_order_id="ord_noise",
+        case_opened_at="2018-01-01T09:00:00-03:00",
+        order_purchase_at="2017-12-20T09:00:00-03:00",
+    )
+
+    assert result.primary_issue_candidate is None
+    assert result.sla_breached_by is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", ["canceled", "unavailable"])
+async def test_shipment_agent_canceled_and_unavailable_orders(
+    status: str,
+    trace_writer: TraceWriter,
+) -> None:
+    """Test DoD: Đơn canceled/unavailable bỏ qua xét giao trễ."""
+    gateway = AsyncMock()
+
+    async def mock_call(tool_name: str, *, case_id: str, **kwargs: Any) -> dict[str, Any]:
+        if tool_name == "get_shipment_summary":
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": f"ev_shipment_summary_{status}_1234567890",
+                "result_hash": "sha256:" + "0" * 64,
+                "domain": "shipment",
+                "data": {
+                    "order_id": "ord_status",
+                    "order_status": status,
+                    "delivered_carrier_at": "2018-03-05T09:00:00-03:00",
+                    "delivered_customer_at": "2018-03-20T09:00:00-03:00",  # past estimated
+                    "estimated_delivery_at": "2018-03-10T09:00:00-03:00",
+                    "shipping_limits": [
+                        {
+                            "order_item_id": "item_001",
+                            "seller_id": "seller_1",
+                            "shipping_limit_at": "2018-03-04T09:00:00-03:00",
+                        }
+                    ],
+                },
+            }
+        elif tool_name == "get_sellers":
+            return {
+                "schema_version": "day09-mcp-evidence-v1",
+                "evidence_ref": f"ev_sellers_info_{status}_123456789012",
+                "result_hash": "sha256:" + "1" * 64,
+                "domain": "seller",
+                "data": [{"seller_id": "seller_1"}],
+            }
+        raise ValueError(f"Unexpected tool: {tool_name}")
+
+    gateway.call = AsyncMock(side_effect=mock_call)
+    agent = ShipmentAgent(gateway, trace_writer)
+    result = await agent.investigate(
+        case_id=f"L3A_CASE_{status.upper()}",
+        claimed_order_id="ord_status",
+        case_opened_at="2018-03-25T09:00:00-03:00",
+    )
+
+    assert result.primary_issue_candidate is None
+    assert result.sla_breached_by is None
+
