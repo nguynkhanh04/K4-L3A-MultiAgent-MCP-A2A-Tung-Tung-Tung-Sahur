@@ -25,13 +25,13 @@ ISSUE_DOMAINS: dict[str, set[str]] = {
     "canceled_order_paid": {"order", "payment"},
     "unavailable_order_paid": {"order", "item", "payment"},
     "late_delivery_seller": {"order", "shipment", "seller"},
-    "late_delivery_logistics": {"order", "shipment"},
+    "late_delivery_logistics": {"order", "item", "shipment", "seller"},  # + handover limit
     "valid_split_payment": {"order", "payment"},
     "payment_mismatch": {"order", "item", "payment"},
     "duplicate_charge": {"order", "payment"},
     "refund_pending": {"order", "payment", "refund"},
     "refund_failed": {"order", "payment", "refund"},
-    "unsupported_claim": {"order"},
+    "unsupported_claim": {"order", "item", "shipment", "seller", "payment"},
 }
 # Có quyết định hoàn tiền/hành động → trích policy làm căn cứ.
 CITE_POLICY_WHEN_ACTION = True
