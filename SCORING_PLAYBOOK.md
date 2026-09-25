@@ -9,7 +9,7 @@
 
 **Mỗi lần nộp bài, session MCP của team bị đóng.** Sau đó mọi tool trả `Error executing tool` cho tới khi có người mở session mới. Quy trình đúng:
 
-1. Mở workspace `/l3a` và nhập Team API Key (hoặc bấm **"Làm mới"**). Việc này mở session mới.
+1. Mở workspace `/l3a`, bấm **"Đổi key"** rồi nhập lại Team API Key. Việc này mở session mới (nút "Làm mới" **không** có tác dụng).
 2. `day09 run`: chạy 6 case song song, tự kết nối lại khi đứt mạng. Nếu bị ngắt giữa chừng thì chạy `day09 run --resume`.
 3. `day09 validate` rồi `day09 package --output dist/submission.zip`.
 4. Nộp **một lần**. Nộp lại cùng file sẽ ra 0 điểm, vì ref thuộc run cũ. Leaderboard vẫn giữ điểm cao nhất nên không mất gì.
