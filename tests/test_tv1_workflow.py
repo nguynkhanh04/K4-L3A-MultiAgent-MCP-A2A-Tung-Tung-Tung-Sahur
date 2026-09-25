@@ -475,7 +475,13 @@ def test_cli_reconnects_and_redoes_only_the_interrupted_case(
     events = [json.loads(x) for x in (tmp_path / "traces" / "trace.jsonl").read_text("utf-8")
               .splitlines()]
     received = [e["case_id"] for e in events if e["event_type"] == "case_received"]
-    assert received == ids  # case 902 chỉ còn 1 lần chạy (lần dở đã bị cắt khỏi trace)
+    assert sorted(received) == ids  # case 902 chỉ còn 1 lần chạy (lần dở không vào trace)
+    blocks = [e["case_id"] for i, e in enumerate(events)
+              if i == 0 or events[i - 1]["case_id"] != e["case_id"]]
+    assert sorted(blocks) == ids  # mỗi case là một khối liền, không xen kẽ giữa các case
+    for cid in ids:
+        kinds = [e["event_type"] for e in events if e["case_id"] == cid]
+        assert kinds[0] == "case_received" and kinds[-1] == "case_finalized"
     for cid in ids:
         out = json.loads((tmp_path / "outputs" / f"{cid}.json").read_text("utf-8"))
         assert out["assessment"]["primary_issue"] == "unsupported_claim"

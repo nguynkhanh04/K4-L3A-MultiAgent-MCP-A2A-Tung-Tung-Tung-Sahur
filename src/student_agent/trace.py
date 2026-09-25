@@ -12,10 +12,13 @@ from .contracts import Contracts
 class TraceWriter:
     """Append observable workflow events. Never put prompts or chain-of-thought here."""
 
-    def __init__(self, path: Path, contracts: Contracts) -> None:
+    def __init__(self, path: Path, contracts: Contracts, *, buffered: bool = False) -> None:
         self.path = path
         self.contracts = contracts
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # buffered=True: keep one case's events in memory and append them in a single write
+        # via flush(), so concurrent cases never interleave and a failed case leaves no trace.
+        self._buffer: list[str] | None = [] if buffered else None
 
     def emit(
         self,
@@ -46,6 +49,18 @@ class TraceWriter:
         }
         event.update({key: value for key, value in optional.items() if value is not None})
         self.contracts.validate_trace(event, "trace event")
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        if self._buffer is not None:
+            self._buffer.append(line)
+        else:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
         return event
+
+    def flush(self) -> None:
+        """Append buffered events to the trace file in one write, then clear the buffer."""
+        if self._buffer:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write("".join(self._buffer))
+        if self._buffer is not None:
+            self._buffer.clear()

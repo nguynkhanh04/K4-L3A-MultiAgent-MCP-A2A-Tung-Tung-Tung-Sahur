@@ -43,41 +43,71 @@ async def _run(root: Path, resume: bool = False) -> None:
         for stale in output_root.glob("*.json"):
             stale.unlink()
         trace_path.unlink(missing_ok=True)
-    trace = TraceWriter(trace_path, contracts)
-
-    # The MCP transport can drop mid-run (TLS ConnectError / ReadError / 502). That kills
-    # the whole session, so reconnect and redo ONLY the interrupted case: its partial
-    # trace lines are truncated first, so every case's evidence comes from one session.
+    # Cases run CONCURRENT_CASES at a time on one MCP session: each call has ~1s latency on
+    # slow links, so a sequential run takes ~20 min. Every case buffers its own trace and is
+    # committed (output file + trace lines) only when it fully succeeds.
+    # The MCP transport can drop mid-run (TLS ConnectError / ReadError / 502) or the team
+    # session can close (e.g. after a submission): unfinished cases are redone on a new
+    # session, so every case's evidence comes from exactly one session.
     pending = [case_id for case_id in case_set.case_ids if case_id not in done]
     failures = 0
     while pending:
+        before = len(pending)
         try:
             async with connect_gateway(
                 settings.mcp_endpoint, settings.team_api_key, contracts
             ) as gateway:
                 if not await gateway.list_tools():
                     raise RuntimeError("MCP Gateway returned no tools")
-                while pending:
-                    case_id = pending[0]
-                    mark = trace_path.stat().st_size if trace_path.exists() else 0
-                    try:
-                        await _solve_one(case_set.cases[case_id], gateway, trace, contracts,
-                                         output_root)
-                    except BaseException:
-                        _truncate(trace_path, mark)
-                        raise
-                    pending.pop(0)
-                    failures = 0
-        except (Exception, TransportLost) as exc:  # noqa: BLE001 — connection lost
-            failures += 1
+                errors = await _run_batch(
+                    [case_set.cases[case_id] for case_id in pending],
+                    gateway, trace_path, contracts, output_root, done,
+                )
+                pending = [case_id for case_id in pending if case_id not in done]
+                if errors:
+                    raise errors[0]
+        except (Exception, TransportLost) as exc:  # noqa: BLE001 — connection/session lost
+            pending = [case_id for case_id in pending if case_id not in done]
+            if not pending:
+                break
+            failures = 0 if len(pending) < before else failures + 1
             if failures > MAX_RECONNECTS:
                 raise
+            hint = (
+                " — team session may be closed (e.g. after a submission): refresh the /l3a "
+                "workspace, then `day09 run --resume`"
+                if isinstance(exc, NoEvidenceError) else ""
+            )
             print(
-                f"WARN: MCP connection lost at {pending[0]} ({type(exc).__name__}); "
-                f"reconnecting ({failures}/{MAX_RECONNECTS})",
+                f"WARN: {len(pending)} case(s) unfinished ({type(exc).__name__}: "
+                f"{str(exc)[:80]}); reconnecting ({failures}/{MAX_RECONNECTS}){hint}",
                 file=sys.stderr,
             )
-            await asyncio.sleep(min(RECONNECT_DELAY_SECONDS * failures, 60.0))
+            await asyncio.sleep(min(RECONNECT_DELAY_SECONDS * max(failures, 1), 60.0))
+
+
+CONCURRENT_CASES = 6
+
+
+async def _run_batch(
+    cases: list[dict],
+    gateway: object,
+    trace_path: Path,
+    contracts: Contracts,
+    output_root: Path,
+    done: set[str],
+) -> list[BaseException]:
+    """Solve cases concurrently (bounded); finished case ids are added to ``done``."""
+    limit = asyncio.Semaphore(CONCURRENT_CASES)
+
+    async def run_case(case: dict) -> None:
+        async with limit:
+            trace = TraceWriter(trace_path, contracts, buffered=True)
+            await _solve_one(case, gateway, trace, contracts, output_root)
+            done.add(case["case_id"])
+
+    results = await asyncio.gather(*(run_case(c) for c in cases), return_exceptions=True)
+    return [r for r in results if isinstance(r, BaseException)]
 
 
 class NoEvidenceError(RuntimeError):
@@ -106,12 +136,6 @@ def _keep_completed(case_ids: tuple[str, ...], output_root: Path, trace_path: Pa
     return done
 
 
-def _truncate(path: Path, size: int) -> None:
-    if path.exists() and path.stat().st_size > size:
-        with path.open("r+b") as handle:
-            handle.truncate(size)
-
-
 async def _solve_one(
     case: dict, gateway: object, trace: TraceWriter, contracts: Contracts, output_root: Path
 ) -> None:
@@ -126,13 +150,14 @@ async def _solve_one(
     contracts.validate_output(output, f"outputs/{case_id}.json")
     if output.get("case_id") != case_id:
         raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
     target = output_root / f"{case_id}.json"
     temporary = target.with_suffix(".json.tmp")
     temporary.write_text(
         json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    trace.flush()
     temporary.replace(target)
-    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
 
 
 def parser() -> argparse.ArgumentParser:

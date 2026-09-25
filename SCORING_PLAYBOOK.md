@@ -5,6 +5,17 @@
 
 ---
 
+## Quy trình chạy và nộp (bắt buộc đọc)
+
+**Mỗi lần nộp bài, session MCP của team bị đóng.** Sau đó mọi tool trả `Error executing tool` cho tới khi có người mở session mới. Quy trình đúng:
+
+1. Mở workspace `/l3a` và nhập Team API Key (hoặc bấm **"Làm mới"**). Việc này mở session mới.
+2. `day09 run`: chạy 6 case song song, tự kết nối lại khi đứt mạng. Nếu bị ngắt giữa chừng thì chạy `day09 run --resume`.
+3. `day09 validate` rồi `day09 package --output dist/submission.zip`.
+4. Nộp **một lần**. Nộp lại cùng file sẽ ra 0 điểm, vì ref thuộc run cũ. Leaderboard vẫn giữ điểm cao nhất nên không mất gì.
+
+**Không chạy `day09 run` trên 2 máy (hoặc 2 terminal) cùng lúc**: trace của hai bên sẽ lẫn vào nhau và bài nộp hỏng.
+
 ## 0. Đọc trước: những gì dữ liệu MCP thật cho thấy (25/09)
 
 Lấy mẫu 10 case (mỗi topic 1 case), gọi đủ tool. Có 3 phát hiện quyết định điểm:
