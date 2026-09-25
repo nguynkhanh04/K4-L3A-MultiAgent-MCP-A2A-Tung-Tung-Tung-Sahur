@@ -80,6 +80,10 @@ async def _run(root: Path, resume: bool = False) -> None:
             await asyncio.sleep(min(RECONNECT_DELAY_SECONDS * failures, 60.0))
 
 
+class NoEvidenceError(RuntimeError):
+    pass
+
+
 MAX_RECONNECTS = 12
 RECONNECT_DELAY_SECONDS = 5.0
 
@@ -114,6 +118,11 @@ async def _solve_one(
     case_id = case["case_id"]
     trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
     output = await solve_case(case, gateway, trace)
+    if not output.get("evidence_refs"):
+        # Every real case has order/payment/shipment evidence; none at all means the MCP
+        # side failed (all tools erroring). Retry on a new session instead of writing an
+        # evidence-less output that the scorer hard-gates to 0.
+        raise NoEvidenceError(f"{case_id}: no MCP evidence retrieved")
     contracts.validate_output(output, f"outputs/{case_id}.json")
     if output.get("case_id") != case_id:
         raise ValueError(f"solver returned a mismatched case_id for {case_id}")
