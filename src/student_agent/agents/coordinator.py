@@ -47,7 +47,7 @@ CORE_TOOLS: dict[str, str] = {
     "get_payment_timeline": "payment-agent",
     "get_refund_timeline": "payment-agent",
 }
-SPECIALIST_STRENGTH = 0.5  # tín hiệu từ agent đồng đội: tham khảo, evidence rules quyết định
+SPECIALIST_STRENGTH = 0.7  # các specialist agents đã hoàn thiện, tăng độ tin cậy
 
 
 class _ToolRunner(BaseAgent):
@@ -88,7 +88,11 @@ class CoordinatorAgent:
             "shipment-agent",
             case_id,
             lambda: shipment_agent.investigate(
-                case_id, order_id, [], case.get("opened_at")
+                case_id,
+                order_id,
+                [],
+                case.get("opened_at"),
+                order_data.get("order_purchase_timestamp"),
             ),
         )
 
@@ -103,6 +107,8 @@ class CoordinatorAgent:
                 gateway=self._gw("payment-agent"),
                 trace=tap,
                 order_status=order_data.get("order_status"),
+                order_purchase_at=order_data.get("order_purchase_timestamp"),
+                case_opened_at=case.get("opened_at"),
             ),
         )
         self._handoff("payment-agent", case_id, "PAYMENT_INVESTIGATED")

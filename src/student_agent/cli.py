@@ -40,24 +40,64 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    total_cases = len(case_set.case_ids)
+    print(f"Connecting to MCP Gateway and processing {total_cases} cases...", flush=True)
+
+    batch_size = 15
+    idx = 0
+    while idx < total_cases:
+        batch_end = min(idx + batch_size, total_cases)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                gw_cm = connect_gateway(
+                    settings.mcp_endpoint, settings.team_api_key, contracts
+                )
+                async with gw_cm as gateway:
+                    discovered_tools = await gateway.list_tools()
+                    if not discovered_tools:
+                        raise RuntimeError("MCP Gateway returned no tools")
+                    while idx < batch_end:
+                        case_id = case_set.case_ids[idx]
+                        case = case_set.cases[case_id]
+                        trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                        output = await solve_case(case, gateway, trace)
+                        contracts.validate_output(output, f"outputs/{case_id}.json")
+                        if output.get("case_id") != case_id:
+                            raise ValueError(f"solver returned mismatched case_id for {case_id}")
+                        target = output_root / f"{case_id}.json"
+                        temporary = target.with_suffix(".json.tmp")
+                        temporary.write_text(
+                            json.dumps(output, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        temporary.replace(target)
+                        trace.emit(
+                            case_id=case_id, event_type="case_finalized", actor="coordinator"
+                        )
+                        issue = output.get("assessment", {}).get("primary_issue", "unknown")
+                        print(f"[{idx + 1:03d}/{total_cases}] {case_id} -> {issue}", flush=True)
+                        idx += 1
+                break
+            except (Exception, BaseExceptionGroup) as exc:
+                curr_case = case_set.case_ids[idx]
+                if attempt < max_retries:
+                    print(
+                        f"Warning: Connection interrupted at case {curr_case} "
+                        f"({type(exc).__name__}). Reconnecting "
+                        f"(attempt {attempt}/{max_retries})...",
+                        flush=True,
+                    )
+                    await asyncio.sleep(2.0)
+                else:
+                    print(
+                        f"ERROR: Failed after {max_retries} attempts at {curr_case}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise
+
+    print(f"Done! Processed {total_cases} cases successfully.", flush=True)
 
 
 def parser() -> argparse.ArgumentParser:
