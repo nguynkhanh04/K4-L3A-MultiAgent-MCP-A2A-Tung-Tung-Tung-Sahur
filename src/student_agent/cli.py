@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from .agents.base import TransportLost
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
@@ -43,61 +44,78 @@ async def _run(root: Path) -> None:
     total_cases = len(case_set.case_ids)
     print(f"Connecting to MCP Gateway and processing {total_cases} cases...", flush=True)
 
-    batch_size = 15
-    idx = 0
-    while idx < total_cases:
-        batch_end = min(idx + batch_size, total_cases)
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            try:
-                gw_cm = connect_gateway(
-                    settings.mcp_endpoint, settings.team_api_key, contracts
-                )
-                async with gw_cm as gateway:
-                    discovered_tools = await gateway.list_tools()
-                    if not discovered_tools:
-                        raise RuntimeError("MCP Gateway returned no tools")
-                    while idx < batch_end:
-                        case_id = case_set.case_ids[idx]
-                        case = case_set.cases[case_id]
-                        trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-                        output = await solve_case(case, gateway, trace)
-                        contracts.validate_output(output, f"outputs/{case_id}.json")
-                        if output.get("case_id") != case_id:
-                            raise ValueError(f"solver returned mismatched case_id for {case_id}")
-                        target = output_root / f"{case_id}.json"
-                        temporary = target.with_suffix(".json.tmp")
-                        temporary.write_text(
-                            json.dumps(output, ensure_ascii=False, indent=2) + "\n",
-                            encoding="utf-8",
+    pending = list(case_set.case_ids)
+    failures = 0
+    batch_count = 0
+    while pending:
+        try:
+            gw_cm = connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            )
+            async with gw_cm as gateway:
+                if not await gateway.list_tools():
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while pending:
+                    case_id = pending[0]
+                    mark = trace_path.stat().st_size if trace_path.exists() else 0
+                    try:
+                        output = await _solve_one(
+                            case_set.cases[case_id], gateway, trace, contracts, output_root
                         )
-                        temporary.replace(target)
-                        trace.emit(
-                            case_id=case_id, event_type="case_finalized", actor="coordinator"
-                        )
+                        done_idx = total_cases - len(pending) + 1
                         issue = output.get("assessment", {}).get("primary_issue", "unknown")
-                        print(f"[{idx + 1:03d}/{total_cases}] {case_id} -> {issue}", flush=True)
-                        idx += 1
-                break
-            except (Exception, BaseExceptionGroup) as exc:
-                curr_case = case_set.case_ids[idx]
-                if attempt < max_retries:
-                    print(
-                        f"Warning: Connection interrupted at case {curr_case} "
-                        f"({type(exc).__name__}). Reconnecting "
-                        f"(attempt {attempt}/{max_retries})...",
-                        flush=True,
-                    )
-                    await asyncio.sleep(2.0)
-                else:
-                    print(
-                        f"ERROR: Failed after {max_retries} attempts at {curr_case}: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    raise
+                        print(f"[{done_idx:03d}/{total_cases}] {case_id} -> {issue}", flush=True)
+                    except BaseException:
+                        _truncate(trace_path, mark)
+                        raise
+                    pending.pop(0)
+                    failures = 0
+                    batch_count += 1
+                    if batch_count >= 15:
+                        batch_count = 0
+                        break  # Cleanly refresh session to prevent keepalive timeout
+        except (Exception, BaseExceptionGroup, TransportLost) as exc:
+            failures += 1
+            if failures > MAX_RECONNECTS:
+                raise
+            print(
+                f"WARN: MCP connection lost at {pending[0]} ({type(exc).__name__}); "
+                f"reconnecting ({failures}/{MAX_RECONNECTS})",
+                file=sys.stderr,
+                flush=True,
+            )
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS * failures)
 
     print(f"Done! Processed {total_cases} cases successfully.", flush=True)
+
+
+MAX_RECONNECTS = 5
+RECONNECT_DELAY_SECONDS = 3.0
+
+
+def _truncate(path: Path, size: int) -> None:
+    if path.exists() and path.stat().st_size > size:
+        with path.open("r+b") as handle:
+            handle.truncate(size)
+
+
+async def _solve_one(
+    case: dict, gateway: object, trace: TraceWriter, contracts: Contracts, output_root: Path
+) -> dict:
+    case_id = case["case_id"]
+    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+    output = await solve_case(case, gateway, trace)
+    contracts.validate_output(output, f"outputs/{case_id}.json")
+    if output.get("case_id") != case_id:
+        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+    target = output_root / f"{case_id}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary.replace(target)
+    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    return output
 
 
 def parser() -> argparse.ArgumentParser:
