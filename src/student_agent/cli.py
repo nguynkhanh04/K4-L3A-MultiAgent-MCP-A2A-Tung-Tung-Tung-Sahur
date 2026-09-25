@@ -28,7 +28,7 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+async def _run(root: Path, resume: bool = False) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -36,15 +36,19 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
+    if resume:
+        done = _keep_completed(case_set.case_ids, output_root, trace_path)
+    else:
+        done = set()
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
     # The MCP transport can drop mid-run (TLS ConnectError / ReadError / 502). That kills
     # the whole session, so reconnect and redo ONLY the interrupted case: its partial
     # trace lines are truncated first, so every case's evidence comes from one session.
-    pending = list(case_set.case_ids)
+    pending = [case_id for case_id in case_set.case_ids if case_id not in done]
     failures = 0
     while pending:
         try:
@@ -73,11 +77,29 @@ async def _run(root: Path) -> None:
                 f"reconnecting ({failures}/{MAX_RECONNECTS})",
                 file=sys.stderr,
             )
-            await asyncio.sleep(RECONNECT_DELAY_SECONDS * failures)
+            await asyncio.sleep(min(RECONNECT_DELAY_SECONDS * failures, 60.0))
 
 
-MAX_RECONNECTS = 5
+MAX_RECONNECTS = 12
 RECONNECT_DELAY_SECONDS = 5.0
+
+
+def _keep_completed(case_ids: tuple[str, ...], output_root: Path, trace_path: Path) -> set[str]:
+    """--resume: keep cases that have an output AND a case_finalized event; drop every trace
+    line of unfinished cases so they are redone cleanly in the new session."""
+    lines = trace_path.read_text(encoding="utf-8").splitlines() if trace_path.exists() else []
+    finalized = {
+        event["case_id"]
+        for event in map(json.loads, filter(None, lines))
+        if event["event_type"] == "case_finalized"
+    }
+    done = {c for c in case_ids if c in finalized and (output_root / f"{c}.json").exists()}
+    for path in output_root.glob("*.json"):
+        if path.stem not in done:
+            path.unlink()
+    kept = [line for line in lines if line and json.loads(line)["case_id"] in done]
+    trace_path.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+    return done
 
 
 def _truncate(path: Path, size: int) -> None:
@@ -110,7 +132,9 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument("--resume", action="store_true",
+                     help="keep finished cases and only run the missing ones")
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -130,7 +154,7 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, resume=args.resume))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")
