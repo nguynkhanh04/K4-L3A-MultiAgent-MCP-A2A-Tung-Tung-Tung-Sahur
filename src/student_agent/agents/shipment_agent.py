@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from ..mcp_gateway import EvidenceGateway
@@ -83,14 +83,16 @@ class ShipmentAgent:
         claimed_order_id: str | None,
         known_seller_ids: list[str] | None = None,
         case_opened_at: str | None = None,
+        order_purchase_at: str | None = None,
     ) -> ShipmentInvestigationResult:
         """Execute shipment and seller investigation for the given case.
 
         1. Queries get_shipment_summary for tracking timeline and SLA metrics.
-        2. Queries get_sellers for seller profile and fulfillment SLA.
-        3. Compares timestamps to accurately distinguish between seller delay
+        2. Queries get_sellers with order_id for seller profile.
+        3. Filters shipping_limits within case window [purchase - 1d, opened_at].
+        4. Compares timestamps to accurately distinguish between seller delay
            and logistics carrier delay.
-        4. Constructs schema-compliant root_cause_analysis and emits observable
+        5. Constructs schema-compliant root_cause_analysis and emits observable
            trace events.
         """
         evidence_refs: list[str] = []
@@ -139,10 +141,63 @@ class ShipmentAgent:
             elif isinstance(raw_data, list) and len(raw_data) > 0 and isinstance(raw_data[0], dict):
                 shipment_data = raw_data[0]
         except Exception:
-            # Record failed tool call attribute via allowed trace event or skip if unavailable
             pass
 
-        # Extract IDs from shipment_data
+        # --- 2. Query MCP get_sellers (called once per order using order_id) ---
+        try:
+            sellers_response = await self.gateway.call(
+                "get_sellers",
+                case_id=case_id,
+                order_id=claimed_order_id,
+            )
+            s_ev_ref = sellers_response.get("evidence_ref")
+            if s_ev_ref and s_ev_ref not in evidence_refs:
+                evidence_refs.append(s_ev_ref)
+
+            self.trace.emit(
+                case_id=case_id,
+                event_type="tool_result_consumed",
+                actor=self.ACTOR_NAME,
+                tool_name="get_sellers",
+                evidence_refs=[s_ev_ref] if s_ev_ref else None,
+            )
+
+            s_data = sellers_response.get("data")
+            if isinstance(s_data, list):
+                for s in s_data:
+                    if isinstance(s, dict) and s.get("seller_id"):
+                        seller_ids_set.add(str(s["seller_id"]))
+            elif isinstance(s_data, dict) and s_data.get("seller_id"):
+                seller_ids_set.add(str(s_data["seller_id"]))
+        except Exception:
+            pass
+
+        # --- 3. Filter shipping_limits by case time window ---
+        opened = _parse_iso(case_opened_at)
+        purchase = _parse_iso(order_purchase_at)
+
+        raw_limits = shipment_data.get("shipping_limits")
+        limits: list[dict[str, Any]] = []
+        if isinstance(raw_limits, list):
+            for lim in raw_limits:
+                if not isinstance(lim, dict):
+                    continue
+                ts = _parse_iso(lim.get("shipping_limit_at"))
+                if not ts:
+                    continue
+                if opened and ts > opened:
+                    continue
+                if purchase and ts < purchase - timedelta(days=1):
+                    continue
+                limits.append(lim)
+
+        for lim in limits:
+            if lim.get("seller_id"):
+                seller_ids_set.add(str(lim["seller_id"]))
+            if lim.get("order_item_id"):
+                shipment_ids_set.add(str(lim["order_item_id"]))
+
+        # Fallback IDs from shipment_data root
         raw_shipment_id = (
             shipment_data.get("shipment_id")
             or shipment_data.get("order_item_id")
@@ -151,129 +206,90 @@ class ShipmentAgent:
         if raw_shipment_id:
             shipment_ids_set.add(str(raw_shipment_id))
 
-        raw_seller_id = shipment_data.get("seller_id")
-        if raw_seller_id:
-            seller_ids_set.add(str(raw_seller_id))
+        if shipment_data.get("seller_id"):
+            seller_ids_set.add(str(shipment_data["seller_id"]))
         elif isinstance(shipment_data.get("seller_ids"), list):
             for s in shipment_data["seller_ids"]:
                 if s:
                     seller_ids_set.add(str(s))
 
-        # --- 2. Query MCP get_sellers ---
-        for s_id in sorted(list(seller_ids_set))[:3]:
-            try:
-                seller_response = await self.gateway.call(
-                    "get_sellers",
-                    case_id=case_id,
-                    seller_id=s_id,
-                )
-                s_ev_ref = seller_response.get("evidence_ref")
-                if s_ev_ref and s_ev_ref not in evidence_refs:
-                    evidence_refs.append(s_ev_ref)
-
-                self.trace.emit(
-                    case_id=case_id,
-                    event_type="tool_result_consumed",
-                    actor=self.ACTOR_NAME,
-                    tool_name="get_sellers",
-                    evidence_refs=[s_ev_ref] if s_ev_ref else None,
-                )
-            except Exception:
-                pass
-
-        # --- 3. Evaluate SLA Timestamps ---
-        limit_date = _parse_iso(
-            shipment_data.get("shipping_limit_date")
-            or shipment_data.get("seller_shipping_limit_date")
-            or shipment_data.get("limit_date")
+        # --- 4. Evaluate SLA Timestamps ---
+        limit_date = min(
+            (
+                _parse_iso(lim["shipping_limit_at"])
+                for lim in limits
+                if lim.get("shipping_limit_at")
+            ),
+            default=None,
         )
-        delivered_carrier = _parse_iso(
-            shipment_data.get("order_delivered_carrier_date")
+        if limit_date is None:
+            limit_date = _parse_iso(
+                shipment_data.get("shipping_limit_date")
+                or shipment_data.get("seller_shipping_limit_date")
+                or shipment_data.get("limit_date")
+            )
+
+        carrier = _parse_iso(
+            shipment_data.get("delivered_carrier_at")
+            or shipment_data.get("order_delivered_carrier_date")
             or shipment_data.get("carrier_handover_date")
             or shipment_data.get("delivered_carrier_date")
         )
-        estimated_delivery = _parse_iso(
-            shipment_data.get("order_estimated_delivery_date")
+        estimated = _parse_iso(
+            shipment_data.get("estimated_delivery_at")
+            or shipment_data.get("order_estimated_delivery_date")
             or shipment_data.get("estimated_delivery_date")
         )
-        delivered_customer = _parse_iso(
-            shipment_data.get("order_delivered_customer_date")
+        arrived = _parse_iso(
+            shipment_data.get("delivered_customer_at")
+            or shipment_data.get("order_delivered_customer_date")
             or shipment_data.get("delivered_customer_date")
         )
-        opened_at = _parse_iso(case_opened_at)
 
+        order_status = str(shipment_data.get("order_status") or "").lower()
         primary_seller_id = (
             sorted(list(seller_ids_set))[0] if seller_ids_set else None
         )
-        carrier_name = str(
-            shipment_data.get("carrier_name")
-            or shipment_data.get("logistics_provider")
-            or "logistics_provider"
-        )
 
-        # Check Seller Handover SLA:
-        # If carrier delivery exists and exceeded limit date:
-        seller_late = False
-        if limit_date and delivered_carrier:
-            if delivered_carrier > limit_date:
-                seller_late = True
-                delay_days_seller = (delivered_carrier - limit_date).total_seconds() / 86400.0
-        elif limit_date and not delivered_carrier:
-            # If carrier handover is missing and case was opened past limit date
-            check_date = opened_at or datetime.now(limit_date.tzinfo)
-            if check_date > limit_date:
-                seller_late = True
-                delay_days_seller = (check_date - limit_date).total_seconds() / 86400.0
-
-        # Check Logistics SLA:
-        logistics_late = False
-        if estimated_delivery and delivered_customer:
-            if delivered_customer > estimated_delivery:
-                logistics_late = True
-                delay_days_logistics = (
-                    delivered_customer - estimated_delivery
-                ).total_seconds() / 86400.0
-        elif estimated_delivery and not delivered_customer:
-            check_date = opened_at or datetime.now(estimated_delivery.tzinfo)
-            if check_date > estimated_delivery:
-                logistics_late = True
-                delay_days_logistics = (
-                    check_date - estimated_delivery
-                ).total_seconds() / 86400.0
-
-        # --- 4. Synthesize Root Cause & Issue Attribution ---
-        if seller_late:
-            primary_issue = "late_delivery_seller"
-            sla_breached_by = "seller"
-            ranked_causes.append(
-                CauseRank(cause_code="SELLER_DISPATCH_TIMEOUT", rank=1).to_dict()
+        # Do not assess late delivery for canceled or unavailable orders
+        if order_status not in ("canceled", "unavailable") and estimated:
+            late = (arrived and arrived > estimated) or (
+                not arrived and opened and opened > estimated
             )
-            responsible_parties.append(
-                ResponsibleParty(party_type="seller", party_id=primary_seller_id).to_dict()
-            )
-
-            # If logistics also took longer, rank as secondary cause
-            if logistics_late:
-                ranked_causes.append(
-                    CauseRank(cause_code="LOGISTICS_DELAY", rank=2).to_dict()
-                )
-                responsible_parties.append(
-                    ResponsibleParty(
-                        party_type="logistics_provider", party_id=carrier_name
-                    ).to_dict()
-                )
-        elif logistics_late:
-            primary_issue = "late_delivery_logistics"
-            sla_breached_by = "logistics"
-            ranked_causes.append(
-                CauseRank(cause_code="LOGISTICS_DELAY", rank=1).to_dict()
-            )
-            responsible_parties.append(
-                ResponsibleParty(party_type="logistics_provider", party_id=carrier_name).to_dict()
-            )
-        else:
-            # Neither seller nor logistics breached delivery timeline
-            sla_breached_by = None
+            if late:
+                seller_late = bool(limit_date and carrier and carrier > limit_date)
+                if seller_late:
+                    primary_issue = "late_delivery_seller"
+                    sla_breached_by = "seller"
+                    if limit_date and carrier:
+                        delay_days_seller = (carrier - limit_date).total_seconds() / 86400.0
+                    ranked_causes.append(
+                        CauseRank(cause_code="SELLER_DISPATCH_TIMEOUT", rank=1).to_dict()
+                    )
+                    responsible_parties.append(
+                        ResponsibleParty(party_type="seller", party_id=primary_seller_id).to_dict()
+                    )
+                    if arrived and arrived > estimated:
+                        ranked_causes.append(
+                            CauseRank(cause_code="LOGISTICS_DELAY", rank=2).to_dict()
+                        )
+                        responsible_parties.append(
+                            ResponsibleParty(
+                                party_type="logistics_provider", party_id=None
+                            ).to_dict()
+                        )
+                else:
+                    primary_issue = "late_delivery_logistics"
+                    sla_breached_by = "logistics"
+                    end_date = arrived or opened
+                    if end_date and estimated:
+                        delay_days_logistics = (end_date - estimated).total_seconds() / 86400.0
+                    ranked_causes.append(
+                        CauseRank(cause_code="LOGISTICS_DELAY", rank=1).to_dict()
+                    )
+                    responsible_parties.append(
+                        ResponsibleParty(party_type="logistics_provider", party_id=None).to_dict()
+                    )
 
         # Emit handoff event from shipment-agent to coordinator
         self.trace.emit(
